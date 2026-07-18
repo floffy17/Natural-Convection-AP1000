@@ -1,0 +1,127 @@
+# ASSIGNMENT 1.1
+import os
+import pandas as pd
+import numpy as np
+import CoolProp.CoolProp as CP
+import math
+
+
+# File path management
+base_path = os.path.dirname(os.path.abspath(__file__))
+file_path = os.path.join(base_path, 'tubi_ansi.csv')
+
+# Input data
+P_bar = 70.0  # Constant pressure for the liquid and steam phases in bar
+P_Pa = P_bar * 1e5  # Pressure in Pascal
+P_th = 34.8e6  # Thermal power to remove [W]
+L_leg = 10.0  # Length for each leg [m]
+g = 9.81  # Gravitational acceleration [m/s2]
+eps_rough = 5.0e-5  # Pipe roughness ( for the point C)
+
+# Concentrated loss coefficients
+# Elbows are also included (4 total elbows: 2 in the steam side, 2 in the liquid side)
+k_elbow = 0.3
+k_heater_tot = 40.0 + 2 * k_elbow
+k_cooler_tot = 20.0 + 2 * k_elbow
+
+#  Thermodynamic properties (CoolProp)
+fluid = 'Water'
+T_sat = CP.PropsSI('T', 'P', P_Pa, 'Q', 0, fluid)
+
+# Properties of the liquid ( cold leg)
+rho_l = CP.PropsSI('D', 'P', P_Pa, 'Q', 0, fluid)
+h_l = CP.PropsSI('H', 'P', P_Pa, 'Q', 0, fluid)
+mu_l = CP.PropsSI('V', 'P', P_Pa, 'Q', 0, fluid)
+# Properties of the steam ( hot leg)
+rho_v = CP.PropsSI('D', 'P', P_Pa, 'Q', 1, fluid)
+h_v = CP.PropsSI('H', 'P', P_Pa, 'Q', 1, fluid)
+mu_v = CP.PropsSI('V', 'P', P_Pa, 'Q', 1, fluid)
+
+# Mass flow [kg/s]
+m_dot = P_th / (h_v - h_l)
+# Buoyancy force [N/m3]
+BF = (rho_l - rho_v) * g
+
+# Functions for the friction factor
+def calc_f_smooth(Re):  # for smooth tubes
+    if Re < 3000:       # laminar
+        return 64.0 / Re
+    return 0.316 / (Re ** 0.25)  # turbulent
+
+
+def calc_f_rough_haaland(Re, eps, D): # for rough tubes
+    if Re < 3000:   # laminar
+        return 64.0 / Re
+    # Haaland equation for turbulent regime
+    term = (eps / D / 3.7) ** 1.11 + 6.9 / Re
+    return (-1.8 * np.log10(term)) ** (-2)
+
+
+# Execution
+try:
+    df = pd.read_csv(file_path)
+    pipes = df[['NPS', 'Outside_Diameter', 'STD']].dropna().copy()
+
+    print(f"--- Properties at {P_bar} bar---")
+    print(f"Liquid density: {rho_l:.2f} kg/m^3 | Steam density: {rho_v:.2f} kg/m^3")
+    print(f"Liquid viscosity: {mu_l:.2e} Pa*s  | Steam viscosity: {mu_v:.2e} Pa*s")
+    print(f"Mass flow: {m_dot:.2f} kg/s\n")
+    # Variables to save the rube NPS 12" results
+    results_12 = {"nps": '12"', "h_a": None, "h_b": None, "h_c": None}
+
+    # Point(a): calculation for each tube
+    print(f"{'NPS':<10} | {'D_int [m]':<10} | {'Height h [m] (Point A)':<15}")
+    print("-" * 55)
+
+    for _, row in pipes.iterrows():
+        # Geometry
+        D_m = (row['Outside_Diameter'] - 2 * row['STD']) * 0.0254
+        Area = (math.pi * D_m ** 2) / 4.0
+
+        # Velocity, dynamic pressure and Reynolds
+        v_l, v_v = m_dot / (rho_l * Area), m_dot / (rho_v * Area)
+        p_l, p_v = 0.5 * rho_l * v_l ** 2, 0.5 * rho_v * v_v ** 2
+        Re_l, Re_v = (rho_l * v_l * D_m) / mu_l, (rho_v * v_v * D_m) / mu_v
+
+        # Friction factor (smooth for the point A)
+        f_l, f_v = calc_f_smooth(Re_l), calc_f_smooth(Re_v)
+
+        # Resolution of the point A (L = 10m fixed)
+        num_a = p_l * (f_l * L_leg / D_m + k_cooler_tot) + p_v * (f_v * L_leg / D_m + k_heater_tot)
+        den_a = BF
+
+        if den_a > 0:
+            h_a = num_a / den_a
+            if h_a > 0:
+                print(f"{row['NPS']:<10} | {D_m:.4f}     | {h_a:.2f}")
+
+                # If it is the 12" pipe, we save the data and calculate the points B and C
+                if row['NPS'] == '12"':
+                    results_12["h_a"] = h_a
+
+                    # Point (b): Smooth (h = L)
+                    num = k_cooler_tot * p_l + k_heater_tot * p_v
+                    den_b = BF - (f_l * p_l / D_m + f_v * p_v / D_m)
+                    results_12["h_b"] = (num) / den_b
+
+                    # Point (c): Rough (h = L)
+                    f_l_r = calc_f_rough_haaland(Re_l, eps_rough, D_m)
+                    f_v_r = calc_f_rough_haaland(Re_v, eps_rough, D_m)
+                    den_c = BF - (f_l_r * p_l / D_m + f_v_r * p_v / D_m)
+                    results_12["h_c"] = (num) / den_c
+
+    # FINAL SUMMARY NPS 12
+    print("\n" + "=" * 50)
+    print(f"RESULTS SUMMARY FOR NPS {results_12['nps']}")
+    print("=" * 50)
+    if results_12["h_a"] is not None:
+        print(f"Point (a) [L = 10m, smooth]:    h = {results_12['h_a']:.2f} m")
+        print(f"Point (b) [h = L, smooth]:      h = {results_12['h_b']:.2f} m")
+        print(f"Point (c) [h = L, rough]:       h = {results_12['h_c']:.2f} m")
+        print("-" * 50)
+    else:
+        print("Tube NPS 12\" not found or not physically valid.")
+
+
+except Exception as e:
+    print(f"Error during the execution: {e}")
